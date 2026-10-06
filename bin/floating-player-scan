@@ -477,8 +477,13 @@ main() {
     DECODED="$(decode_image "$IMAGE")" || DECODED=""
     [[ -n $DECODED ]] || { notify normal "No QR code found in $IMAGE" 4000; exit "$E_NO_CODE"; }
   else
-    local runtime="${XDG_RUNTIME_DIR:-/tmp}/floating-player"
-    mkdir -p "$runtime"
+    local runtime
+    if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+      runtime="$XDG_RUNTIME_DIR/floating-player"
+    else
+      runtime="${XDG_DATA_HOME:-$HOME/.local/share}/floating-player/run" # not shared /tmp
+    fi
+    mkdir -p "$runtime" && chmod 700 "$runtime"
     exec 9>"$runtime/scan.lock"
     flock -n 9 || die "$E_ERR" "A QR scan is already running"
     WORK="$(mktemp -d "$runtime/scan.XXXXXX")"

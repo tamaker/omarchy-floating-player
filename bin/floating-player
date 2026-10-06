@@ -13,8 +13,10 @@ FP_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/floating-player"
 if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
   FP_RUN="$XDG_RUNTIME_DIR/floating-player"
 else
-  FP_RUN="/tmp/floating-player-$UID"
+  FP_RUN="$FP_DATA/run" # never a predictable path in shared /tmp
 fi
+# Profiles hold signed-in sessions: keep the whole tree owner-only.
+mkdir -p "$FP_DATA" && chmod 700 "$FP_DATA" 2>/dev/null || true
 FP_STATE="$FP_DATA/state.json"
 FP_SPECIAL="special:floating-player"
 FP_MARGIN="${FP_MARGIN:-24}"
