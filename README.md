@@ -6,6 +6,9 @@ follows you across workspaces; a bar icon shows, hides, resizes and moves it.
 Sign in by scanning a QR code with your phone, and send a video from your phone
 to the player by holding its QR code up to the laptop camera.
 
+**Official Omarchy plugin page:**
+<https://plugins.omarchy.org/plugin.html?id=tamaker.floating-player>
+
 An Omarchy shell plugin (`tamaker.floating-player`). It never edits your
 Hyprland config: the window is floated, pinned and placed by launch rules and
 `hyprctl` calls at runtime.
@@ -50,6 +53,10 @@ Hyprland config: the window is floated, pinned and placed by launch rules and
   `sqlite3`.
 
 ## Install
+
+Listed in the Omarchy plugin marketplace:
+[plugins.omarchy.org/plugin.html?id=tamaker.floating-player](https://plugins.omarchy.org/plugin.html?id=tamaker.floating-player).
+Install from there, or directly:
 
 ```bash
 omarchy plugin add https://github.com/tamaker/omarchy-floating-player.git --enable
