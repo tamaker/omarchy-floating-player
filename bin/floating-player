@@ -1,0 +1,795 @@
+#!/bin/bash
+# floating-player: always-on-top floating YouTube / YouTube TV player for
+# Omarchy (Hyprland, Lua config). Everything is done at runtime through
+# hyprctl; nothing in ~/.config/hypr is touched. See docs/core.md.
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/sources.sh
+source "$DIR/../lib/sources.sh"
+
+FP_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/floating-player"
+if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  FP_RUN="$XDG_RUNTIME_DIR/floating-player"
+else
+  FP_RUN="/tmp/floating-player-$UID"
+fi
+FP_STATE="$FP_DATA/state.json"
+FP_SPECIAL="special:floating-player"
+FP_MARGIN="${FP_MARGIN:-24}"
+FP_LAUNCH_TIMEOUT="${FP_LAUNCH_TIMEOUT:-20}" # seconds to wait for the window
+FP_SIZES=(small medium large full)
+FP_CORNERS=(tl tr br bl) # cycle order: clockwise
+FP_OPACITY_MIN=20        # percent; below this the player is hard to find again
+
+usage() {
+  cat <<'EOF'
+Usage: floating-player <command> [args]
+
+  open [youtube|youtubetv|<url>]   launch, or switch source / navigate
+                                   (default: last source, youtube the first time;
+                                   a source resumes the page it was last on)
+  toggle                           show/hide; launches if not running
+  show | hide | close
+  size small|medium|large|full|cycle
+                                   16:9, relative to the monitor; full = real
+                                   fullscreen, again (or another size) restores
+  corner tl|tr|bl|br|cycle
+  opacity <20-100>                 window opacity in percent (remembered)
+  status                           one JSON line:
+                                   {"running":bool,"visible":bool,"source":"…","size":"…","corner":"…","opacity":N}
+  signin [youtube|youtubetv]       sign in to a source (floating-player-signin)
+  scan                             scan a QR code (floating-player-scan)
+  launch-raw --source <name> --url <url>
+                                   internal: (re)start that source's window at <url>
+
+Environment: FP_BROWSER (browser binary), FP_MARGIN (px, default 24),
+FP_LAUNCH_TIMEOUT (s, default 20), FP_RESUME=0 (start on the source's home
+page instead of resuming the last video / channel).
+EOF
+}
+
+die() {
+  printf 'floating-player: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'floating-player: %s\n' "$*" >&2
+}
+
+require() {
+  local cmd
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required but not installed"
+  done
+}
+
+is_source() {
+  local s
+  for s in "${FP_SOURCES[@]}"; do
+    [[ $s == "$1" ]] && return 0
+  done
+  return 1
+}
+
+profile_dir() {
+  printf '%s/profiles/%s' "$FP_DATA" "$(fp_source "$1" profile)"
+}
+
+# ---------------------------------------------------------------------------
+# State: { source, size, corner, restore, opacity } in $FP_STATE
+# ---------------------------------------------------------------------------
+
+ST_SOURCE=youtube ST_SIZE=medium ST_CORNER=br ST_RESTORE=medium ST_OPACITY=100
+
+load_state() {
+  local line s1 s2 s3 s4 s5
+  [[ -s $FP_STATE ]] || return 0
+  line=$(jq -r '[.source // "", .size // "", .corner // "", .restore // "", (.opacity // "" | tostring)] | @tsv' "$FP_STATE" 2>/dev/null) || return 0
+  IFS=$'\t' read -r s1 s2 s3 s4 s5 <<<"$line" || true
+  is_source "${s1:-}" && ST_SOURCE=$s1
+  [[ ${s2:-} =~ ^(small|medium|large|full)$ ]] && ST_SIZE=$s2
+  [[ ${s3:-} =~ ^(tl|tr|bl|br)$ ]] && ST_CORNER=$s3
+  [[ ${s4:-} =~ ^(small|medium|large)$ ]] && ST_RESTORE=$s4
+  [[ ${s5:-} =~ ^[0-9]{1,3}$ ]] && ((s5 >= FP_OPACITY_MIN && s5 <= 100)) && ST_OPACITY=$s5
+  return 0
+}
+
+save_state() {
+  mkdir -p "$FP_DATA"
+  jq -n --arg source "$ST_SOURCE" --arg size "$ST_SIZE" --arg corner "$ST_CORNER" --arg restore "$ST_RESTORE" \
+    --argjson opacity "$ST_OPACITY" \
+    '{source: $source, size: $size, corner: $corner, restore: $restore, opacity: $opacity}' >"$FP_STATE.tmp"
+  mv -f "$FP_STATE.tmp" "$FP_STATE"
+}
+
+# ST_OPACITY (percent) as Hyprland's 0–1 factor: 100 -> 1.0, 45 -> 0.45.
+opacity_factor() {
+  if ((ST_OPACITY >= 100)); then
+    printf '1.0'
+  else
+    printf '0.%02d' "$ST_OPACITY"
+  fi
+}
+
+# Lua that sets the player's opacity, active and inactive alike (the player is
+# usually unfocused while you work under it). Expects `w` in scope.
+opacity_lua() {
+  local f
+  f=$(opacity_factor)
+  cat <<EOF
+for _, p in ipairs({ 'opacity', 'opacity_inactive' }) do
+  hl.dispatch(hl.dsp.window.set_prop({ window = w, prop = p, value = '$f' }))
+end
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Hyprland helpers
+# ---------------------------------------------------------------------------
+
+SNAP=""
+
+# One IPC round trip for clients + monitors; jq -s turns it into [clients, monitors].
+snapshot() {
+  SNAP=$(hyprctl --batch 'j/clients;j/monitors' 2>/dev/null) || die "cannot talk to Hyprland (is it running?)"
+  [[ $SNAP == "["* ]] || die "unexpected hyprctl output: ${SNAP:0:200}"
+}
+
+# Run Lua in the compositor. hyprctl prints "ok" on success, "error: …" on a
+# Lua error, and "warning: …" lines when a dispatcher declines (non-fatal).
+hl_eval() {
+  local out
+  out=$(hyprctl eval "$1" 2>&1) || true
+  [[ $out == ok* ]] && return 0
+  [[ $out == *error* ]] && die "hyprctl eval failed: $out"
+  [[ -n ${FP_DEBUG:-} ]] && warn "hyprctl eval: $out"
+  return 0
+}
+
+# The browser pid of a source = the pid in its profile's SingletonLock
+# (hostname-PID), verified against /proc so a stale lock or a reused pid never
+# matches. The window pid in `hyprctl clients` is that same browser process.
+source_pid() {
+  local dir lock pid joined
+  local -a args
+  dir=$(profile_dir "$1")
+  lock=$(readlink "$dir/SingletonLock" 2>/dev/null) || return 1
+  pid=${lock##*-}
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  mapfile -d '' -t args <"/proc/$pid/cmdline" 2>/dev/null || return 1
+  # Chromium rewrites its argv into one space-joined string, so match on the
+  # joined form (works for both layouts).
+  joined=" ${args[*]} "
+  [[ $joined == *" --user-data-dir=$dir "* ]] || return 1
+  printf '%s' "$pid"
+}
+
+addr_file() {
+  printf '%s/%s.addr' "$FP_RUN" "$1"
+}
+
+# win_info <pid> [preferred-address]  (uses $SNAP)
+# Prints: address  workspace-name  monitor-id  fullscreen  visible(true/false)
+win_info() {
+  local pref=""
+  [[ -r $(addr_file "$SRC") ]] && pref=$(<"$(addr_file "$SRC")")
+  jq -rs --argjson pid "$1" --arg pref "$pref" '
+    .[0] as $clients | .[1] as $mons |
+    [$clients[] | select(.pid == $pid and .mapped != false and .hidden != true)] as $w |
+    ([$w[] | select(.address == $pref)] + $w | first) // empty |
+    . as $c |
+    [ $c.address, $c.workspace.name, $c.monitor, $c.fullscreen,
+      ( ($c.workspace.name | startswith("special:") | not)
+        and ($c.pinned or ([$mons[].activeWorkspace.id] | index($c.workspace.id)) != null) ) ]
+    | @tsv' <<<"$SNAP"
+}
+
+# find_player: sets SRC ADDR MON FS VISIBLE for the running player
+# (first source that has a browser process with a window). Returns 1 if none.
+SRC="" ADDR="" MON="" FS=0 VISIBLE=false
+find_player() {
+  local s pid info
+  [[ -n $SNAP ]] || snapshot
+  for s in "${FP_SOURCES[@]}"; do
+    pid=$(source_pid "$s") || continue
+    SRC=$s
+    info=$(win_info "$pid") || info=""
+    [[ -n $info ]] || continue
+    IFS=$'\t' read -r ADDR _ MON FS VISIBLE <<<"$info"
+    return 0
+  done
+  SRC="" ADDR=""
+  return 1
+}
+
+# geometry <size> <corner> <monitor-id|-1 for focused>   (uses $SNAP)
+# Prints: w h x y (global layout coords) mx my (monitor origin)
+geometry() {
+  jq -rs --arg size "$1" --arg corner "$2" --argjson mon "$3" --argjson margin "$FP_MARGIN" '
+    .[1] as $ms |
+    (([$ms[] | select(.id == $mon)] | first) // ([$ms[] | select(.focused)] | first) // $ms[0]) as $m |
+    (($m.transform % 2) == 1) as $rot |
+    ((if $rot then $m.height else $m.width end) / $m.scale | floor) as $lw |
+    ((if $rot then $m.width else $m.height end) / $m.scale | floor) as $lh |
+    ($m.reserved // [0, 0, 0, 0]) as $r |
+    ({small: 0.25, medium: 0.40, large: 0.60}[$size] // 0.40) as $pct |
+    ($lw - $r[0] - $r[2] - 2 * $margin) as $aw |
+    ($lh - $r[1] - $r[3] - 2 * $margin) as $ah |
+    ([$lw * $pct, $aw] | min | floor) as $w0 |
+    (if ($w0 * 9 / 16) > $ah then [($ah * 16 / 9 | floor), $ah] else [$w0, ($w0 * 9 / 16 | round)] end) as $wh |
+    $wh[0] as $w | $wh[1] as $h |
+    (if ($corner | test("l$")) then $m.x + $r[0] + $margin else $m.x + $lw - $r[2] - $margin - $w end) as $x |
+    (if ($corner | test("^t")) then $m.y + $r[1] + $margin else $m.y + $lh - $r[3] - $margin - $h end) as $y |
+    [$w, $h, $x, $y, $m.x, $m.y] | map(floor | tostring) | join(" ")' <<<"$SNAP"
+}
+
+# Focused monitor's id and active (regular) workspace id.
+focused_monitor() {
+  jq -rs '.[1] | ([.[] | select(.focused)] | first) // .[0] | "\(.id) \(.activeWorkspace.id)"' <<<"$SNAP"
+}
+
+# The size the player currently shows: live fullscreen wins; a state of "full"
+# with the window no longer fullscreen (user pressed SUPER+F) means the restore size.
+current_size() {
+  if [[ -n $ADDR && $FS != 0 ]]; then
+    echo full
+  elif [[ $ST_SIZE == full && -n $ADDR && $VISIBLE == true ]]; then
+    echo "$ST_RESTORE"
+  else
+    echo "$ST_SIZE"
+  fi
+}
+
+# place_lua <address> <monitor-id|-1>: Lua that floats/pins/sizes/moves the
+# window per state, or makes it fullscreen. Decisions that depend on the live
+# window (is it fullscreen?) are made in Lua, inside the compositor.
+place_lua() {
+  local w h x y _mx _my
+  if [[ $ST_SIZE == full ]]; then
+    read -r w h x y _mx _my <<<"$(geometry "$ST_RESTORE" "$ST_CORNER" "$2")"
+    # Hyprland refuses to fullscreen a pinned window, so unpin first; moving it
+    # first puts it on the target monitor.
+    cat <<EOF
+local w = 'address:$1'
+local win = hl.get_window(w)
+if win and win.fullscreen == 0 then
+  hl.dispatch(hl.dsp.window.pin({ window = w, action = 'disable' }))
+  hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' }))
+  hl.dispatch(hl.dsp.window.move({ window = w, x = $x, y = $y }))
+  hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = 'fullscreen', action = 'set' }))
+end
+EOF
+  else
+    read -r w h x y _mx _my <<<"$(geometry "$ST_SIZE" "$ST_CORNER" "$2")"
+    cat <<EOF
+local w = 'address:$1'
+local win = hl.get_window(w)
+if win then
+  if win.fullscreen ~= 0 then
+    hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = 'fullscreen', action = 'unset' }))
+  end
+  hl.dispatch(hl.dsp.window.float({ window = w, action = 'enable' }))
+  hl.dispatch(hl.dsp.window.resize({ window = w, x = $w, y = $h }))
+  hl.dispatch(hl.dsp.window.move({ window = w, x = $x, y = $y }))
+  hl.dispatch(hl.dsp.window.pin({ window = w, action = 'enable' }))
+end
+EOF
+  fi
+  cat <<EOF
+if win then
+  for _, p in ipairs({ 'keep_aspect_ratio', 'no_blur', 'no_dim' }) do
+    hl.dispatch(hl.dsp.window.set_prop({ window = w, prop = p, value = '1' }))
+  end
+$(opacity_lua)
+end
+EOF
+}
+
+place() {
+  hl_eval "$(place_lua "$1" "$2")"
+}
+
+# show_window: bring the (hidden or stray) window to the focused monitor's
+# active workspace, re-pin and re-place it, focus it. One eval, so it happens
+# in a single compositor tick.
+show_window() {
+  local fmon fws
+  read -r fmon fws <<<"$(focused_monitor)"
+  hl_eval "do
+local w = 'address:$ADDR'
+local win = hl.get_window(w)
+if win and not win.pinned and not (win.workspace and win.workspace.id == $fws) then
+  if win.fullscreen ~= 0 then
+    hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = 'fullscreen', action = 'unset' }))
+  end
+  hl.dispatch(hl.dsp.window.move({ window = w, workspace = '$fws', follow = false }))
+end
+end
+do
+$(place_lua "$ADDR" "$fmon")
+end
+hl.dispatch(hl.dsp.focus({ window = 'address:$ADDR' }))"
+}
+
+# hide_window: unpin (a pinned window can't change workspace) and park it on a
+# special workspace silently, so the special workspace never opens on screen.
+hide_window() {
+  hl_eval "local w = 'address:$ADDR'
+local win = hl.get_window(w)
+if win then
+  if win.fullscreen ~= 0 then
+    hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = 'fullscreen', action = 'unset' }))
+  end
+  hl.dispatch(hl.dsp.window.pin({ window = w, action = 'disable' }))
+  hl.dispatch(hl.dsp.window.move({ window = w, workspace = '$FP_SPECIAL', follow = false }))
+end"
+}
+
+# ---------------------------------------------------------------------------
+# Browser
+# ---------------------------------------------------------------------------
+
+find_browser() {
+  local b
+  if [[ -n ${FP_BROWSER:-} ]]; then
+    command -v "$FP_BROWSER" >/dev/null 2>&1 || die "FP_BROWSER='$FP_BROWSER' not found"
+    printf '%s' "$FP_BROWSER"
+    return
+  fi
+  for b in chromium google-chrome-stable google-chrome brave brave-browser; do
+    if command -v "$b" >/dev/null 2>&1; then
+      printf '%s' "$b"
+      return
+    fi
+  done
+  die "no Chromium-based browser found (install chromium, google-chrome or brave)"
+}
+
+# Copy an existing Widevine CDM into a fresh profile so DRM works on first
+# launch instead of after the component updater gets around to it. Chromium
+# reads <user-data-dir>/WidevineCdm/latest-component-updated-widevine-cdm
+# ({"Path": "<abs version dir>"}) at startup.
+seed_widevine() {
+  local dest="$1/WidevineCdm" src hint ver
+  [[ -e $dest/latest-component-updated-widevine-cdm ]] && return 0
+  for src in "$HOME/.config/chromium/WidevineCdm" \
+    "$HOME/.config/google-chrome/WidevineCdm" \
+    "$HOME/.config/BraveSoftware/Brave-Browser/WidevineCdm"; do
+    [[ -d $src ]] || continue
+    ver=""
+    if [[ -r $src/latest-component-updated-widevine-cdm ]]; then
+      hint=$(jq -r '.Path // empty' "$src/latest-component-updated-widevine-cdm" 2>/dev/null) || hint=""
+      [[ -n $hint && -d $hint ]] && ver=$(basename "$hint")
+    fi
+    if [[ -z $ver ]]; then
+      ver=$(find "$src" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null | sort -V | tail -n1)
+    fi
+    [[ -n $ver && -d $src/$ver/_platform_specific ]] || continue
+    mkdir -p "$dest"
+    cp -a "$src/$ver" "$dest/" || { rm -rf "$dest"; return 0; }
+    jq -n --arg p "$dest/$ver" '{Path: $p}' >"$dest/latest-component-updated-widevine-cdm"
+    return 0
+  done
+  return 0
+}
+
+# stop_source <source>: close its window(s) politely, then make sure the
+# browser process is gone. Only the pid is signalled, never its process group:
+# processes started via hl.exec_cmd share Hyprland's process group.
+stop_source() {
+  local s=$1 pid addr i
+  pid=$(source_pid "$s") || { rm -f "$(addr_file "$s")"; return 0; }
+  [[ -n $SNAP ]] || snapshot
+  for addr in $(jq -rs --argjson pid "$pid" '.[0][] | select(.pid == $pid) | .address' <<<"$SNAP"); do
+    hyprctl dispatch "hl.dsp.window.close({ window = 'address:$addr' })" >/dev/null 2>&1 || true
+  done
+  for ((i = 0; i < 30; i++)); do
+    [[ -e /proc/$pid ]] || break
+    sleep 0.1
+  done
+  if [[ -e /proc/$pid ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((i = 0; i < 30; i++)); do
+      [[ -e /proc/$pid ]] || break
+      sleep 0.1
+    done
+    [[ -e /proc/$pid ]] && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$(addr_file "$s")"
+  SNAP=""
+}
+
+# launch <source> <url>: start the source's browser at <url>. Window rules are
+# passed to hl.exec_cmd, which applies them to the spawned pid's windows, so
+# the window maps already floating, pinned and placed (no tiled flash) without
+# any persistent window rule.
+launch() {
+  local s=$1 url=$2 browser dir ua fmon _fws w h x y mx my cmd rules i pid info
+  browser=$(find_browser)
+  dir=$(profile_dir "$s")
+  mkdir -p "$dir" "$FP_RUN"
+  seed_widevine "$dir"
+  ua=$(fp_source "$s" ua)
+
+  local -a argv=(
+    "$browser"
+    "--user-data-dir=$dir"
+    "--class=floating-player-$s"
+    "--app=$url"
+    --no-first-run
+    --no-default-browser-check
+    --hide-crash-restore-bubble
+    --autoplay-policy=no-user-gesture-required
+    --ozone-platform-hint=auto
+  )
+  [[ -n $ua ]] && argv+=("--user-agent=$ua")
+  cmd=$(printf '%q ' "${argv[@]}")
+  command -v uwsm-app >/dev/null 2>&1 && cmd="uwsm-app -- $cmd"
+  [[ $cmd == *']==]'* ]] && die "refusing to launch: unsupported characters in URL"
+
+  [[ -n $SNAP ]] || snapshot
+  read -r fmon _fws <<<"$(focused_monitor)"
+  local sz=$ST_SIZE
+  [[ $sz == full ]] && sz=$ST_RESTORE
+  read -r w h x y mx my <<<"$(geometry "$sz" "$ST_CORNER" "$fmon")"
+  # Rule `move` is relative to the monitor.
+  rules="{ float = true, pin = true, size = { $w, $h }, move = { $((x - mx)), $((y - my)) },
+    keep_aspect_ratio = true, opacity = '$(opacity_factor) $(opacity_factor)', no_blur = true, no_dim = true,
+    tag = '-default-opacity' }"
+  rm -f "$(addr_file "$s")"
+  hl_eval "hl.exec_cmd([==[$cmd]==], $rules)"
+
+  for ((i = 0; i < FP_LAUNCH_TIMEOUT * 10; i++)); do
+    if pid=$(source_pid "$s"); then
+      snapshot
+      info=$(SRC=$s win_info "$pid") || info=""
+      if [[ -n $info ]]; then
+        IFS=$'\t' read -r ADDR _ MON FS VISIBLE <<<"$info"
+        SRC=$s
+        printf '%s' "$ADDR" >"$(addr_file "$s")"
+        place "$ADDR" "$fmon"
+        hl_eval "hl.dispatch(hl.dsp.focus({ window = 'address:$ADDR' }))"
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  die "$browser window for '$s' did not appear within ${FP_LAUNCH_TIMEOUT}s"
+}
+
+# ---------------------------------------------------------------------------
+# URL resolution: prints "<source>\t<url>"
+# ---------------------------------------------------------------------------
+
+urlparam() { # urlparam <query-string> <name>
+  local kv
+  local IFS='&'
+  for kv in $1; do
+    if [[ ${kv%%=*} == "$2" ]]; then
+      printf '%s' "${kv#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_url() {
+  local url=$1 rest rawhost host path query id="" yt_start
+  [[ $url =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]] || url="https://$url"
+  rest=${url#*://}
+  rawhost=${rest%%[/?#]*}
+  host=${rawhost,,}
+  host=${host%%:*}
+  path=${rest#"$rawhost"}
+  path=${path%%[?#]*}
+  query=""
+  [[ $rest == *\?* ]] && query=${rest#*\?} && query=${query%%#*}
+
+  case $host in
+    tv.youtube.com)
+      # The TV app's sign-in lives in its own storage, not tv.youtube.com's
+      # cookies, so desktop links would open signed out: start the app instead.
+      [[ ${FP_YOUTUBETV_MODE:-tv} == web ]] || url=$(fp_source youtubetv url)
+      printf 'youtubetv\t%s\n' "$url"
+      return
+      ;;
+    youtu.be)
+      id=${path#/}
+      id=${id%%/*}
+      ;;
+    youtube.com | www.youtube.com | m.youtube.com | music.youtube.com | youtube-nocookie.com | www.youtube-nocookie.com)
+      case $path in
+        /watch) id=$(urlparam "$query" v) || id="" ;;
+        /shorts/* | /live/* | /embed/* | /v/*)
+          id=${path#/*/}
+          id=${id%%/*}
+          ;;
+      esac
+      ;;
+    *)
+      printf 'youtube\t%s\n' "$url"
+      return
+      ;;
+  esac
+
+  if [[ $id =~ ^[A-Za-z0-9_-]{6,}$ ]]; then
+    yt_start=$(fp_source youtube url)
+    if [[ $yt_start == *youtube.com/tv* ]]; then
+      # The youtube source is the TV ("leanback") app; it plays a video from
+      # its own hash route (after the account picker on a fresh profile).
+      url="https://www.youtube.com/tv#/watch?v=$id"
+    else
+      url="https://www.youtube.com/watch?v=$id"
+    fi
+  fi
+  printf 'youtube\t%s\n' "$url"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+LOCK_FD=9
+take_lock() { # take_lock wait|nowait
+  mkdir -p "$FP_RUN"
+  exec 9>"$FP_RUN/lock"
+  if [[ $1 == nowait ]]; then
+    if ! flock -n "$LOCK_FD"; then
+      warn "another floating-player command is still running; ignored"
+      exit 0
+    fi
+  else
+    flock -w 30 "$LOCK_FD" || die "timed out waiting for another floating-player command"
+  fi
+}
+
+# last_url <source>: the page that source's app was last on (a video, a live
+# channel, a browse page), read from the newest Chromium session file in its
+# profile. Chromium keeps the app's hash route there (…/tv#/watch?v=ID), so
+# relaunching at it resumes the video. Prints nothing if there is none.
+last_url() {
+  local s=$1 base sessions file u rest found=""
+  base=$(fp_source "$s" url)
+  sessions="$(profile_dir "$s")/Default/Sessions"
+  [[ -n $base && -d $sessions ]] || return 0
+  file=$(find "$sessions" -maxdepth 1 -type f \( -name 'Apps_*' -o -name 'Tabs_*' \) -printf '%T@ %p\n' 2>/dev/null |
+    sort -rn | head -n1 | cut -d' ' -f2-)
+  [[ -n $file ]] || return 0
+  while IFS= read -r u; do
+    [[ $u == "$base"* ]] || continue
+    # …/tv must not pick up …/tv/upg (YouTube TV's app) and vice versa.
+    rest=${u#"$base"}
+    [[ $base == */ || -z $rest || $rest == [#?]* ]] || continue
+    # Plain URL characters only: this ends up on a command line.
+    [[ $u =~ ^https://[A-Za-z0-9._~:/?#\&=%+@!,\;-]+$ ]] || continue
+    found=$u
+  done < <(grep -aoE 'https://[A-Za-z0-9._~:/?#&=%+@!,;-]+' "$file" 2>/dev/null || true)
+  # Keep only the app's own route: query flags such as is_account_switch=1
+  # would replay an account switch on every launch.
+  [[ $found == *'#'* && $base != */ ]] && found="$base#${found#*#}"
+  [[ -n $found ]] && printf '%s' "$found"
+  return 0
+}
+
+# open_source <source> [url]: single player. With a url the source's window is
+# restarted at that url (navigation); without one an existing window is shown.
+open_source() {
+  local s=$1 url=${2:-} other
+  load_state
+  snapshot
+  for other in "${FP_SOURCES[@]}"; do
+    [[ $other == "$s" ]] && continue
+    source_pid "$other" >/dev/null && stop_source "$other"
+  done
+  [[ -n $SNAP ]] || snapshot
+
+  local pid info=""
+  if pid=$(source_pid "$s"); then
+    info=$(SRC=$s win_info "$pid") || info=""
+    if [[ -n $info && -z $url ]]; then
+      IFS=$'\t' read -r ADDR _ MON FS VISIBLE <<<"$info"
+      SRC=$s
+      show_window
+      ST_SOURCE=$s
+      save_state
+      return 0
+    fi
+    # Running without a window, or navigating: restart so the launch rules apply.
+    stop_source "$s"
+  fi
+  # No url: resume wherever this source was last (unless FP_RESUME=0).
+  [[ -n $url || ${FP_RESUME:-1} == 0 ]] || url=$(last_url "$s")
+  [[ -n $url ]] || url=$(fp_source "$s" url)
+  [[ -n $url ]] || die "source '$s' has no start url in lib/sources.sh"
+  ST_SOURCE=$s
+  save_state
+  launch "$s" "$url"
+}
+
+cmd_open() {
+  local arg=${1:-} s url
+  take_lock nowait
+  if [[ -z $arg ]]; then
+    load_state
+    open_source "$ST_SOURCE"
+  elif is_source "$arg"; then
+    open_source "$arg"
+  elif [[ $arg == *.* || $arg == *://* ]]; then
+    IFS=$'\t' read -r s url <<<"$(resolve_url "$arg")"
+    open_source "$s" "$url"
+  else
+    die "unknown source or url: '$arg' (sources: ${FP_SOURCES[*]})"
+  fi
+}
+
+cmd_toggle() {
+  take_lock nowait
+  load_state
+  if ! find_player; then
+    open_source "$ST_SOURCE"
+  elif [[ $VISIBLE == true ]]; then
+    hide_window
+  else
+    show_window
+  fi
+}
+
+cmd_show() {
+  take_lock nowait
+  load_state
+  if find_player; then
+    show_window
+  else
+    open_source "$ST_SOURCE"
+  fi
+}
+
+cmd_hide() {
+  take_lock wait
+  load_state
+  find_player || return 0
+  [[ $VISIBLE == true ]] && hide_window
+  return 0
+}
+
+cmd_close() {
+  local s
+  take_lock wait
+  snapshot
+  for s in "${FP_SOURCES[@]}"; do
+    stop_source "$s"
+  done
+}
+
+cmd_size() {
+  local want=${1:-} cur i
+  [[ $want =~ ^(small|medium|large|full|cycle)$ ]] || die "usage: floating-player size small|medium|large|full|cycle"
+  take_lock wait
+  load_state
+  find_player || true
+  cur=$(current_size)
+  if [[ $want == cycle ]]; then
+    for i in "${!FP_SIZES[@]}"; do
+      [[ ${FP_SIZES[$i]} == "$cur" ]] && want=${FP_SIZES[$(((i + 1) % ${#FP_SIZES[@]}))]}
+    done
+    [[ $want == cycle ]] && want=medium
+  elif [[ $want == full && $cur == full ]]; then
+    want=$ST_RESTORE # `size full` again leaves fullscreen
+  fi
+  if [[ $want == full ]]; then
+    [[ $cur != full ]] && ST_RESTORE=$cur
+  else
+    ST_RESTORE=$want
+  fi
+  ST_SIZE=$want
+  save_state
+  if [[ -n $ADDR && $VISIBLE == true ]]; then
+    place "$ADDR" "$MON"
+  fi
+}
+
+cmd_corner() {
+  local want=${1:-} i
+  [[ $want =~ ^(tl|tr|bl|br|cycle)$ ]] || die "usage: floating-player corner tl|tr|bl|br|cycle"
+  take_lock wait
+  load_state
+  if [[ $want == cycle ]]; then
+    for i in "${!FP_CORNERS[@]}"; do
+      [[ ${FP_CORNERS[$i]} == "$ST_CORNER" ]] && want=${FP_CORNERS[$(((i + 1) % ${#FP_CORNERS[@]}))]}
+    done
+  fi
+  ST_CORNER=$want
+  save_state
+  find_player || return 0
+  # In fullscreen the corner only applies once fullscreen is left.
+  if [[ $VISIBLE == true && $FS == 0 ]]; then
+    [[ $ST_SIZE == full ]] && ST_SIZE=$ST_RESTORE && save_state
+    place "$ADDR" "$MON"
+  fi
+}
+
+cmd_opacity() {
+  local want=${1:-}
+  [[ $want =~ ^[0-9]{1,3}%?$ ]] || die "usage: floating-player opacity <$FP_OPACITY_MIN-100>"
+  want=${want%\%}
+  ((want < FP_OPACITY_MIN)) && want=$FP_OPACITY_MIN
+  ((want > 100)) && want=100
+  take_lock wait
+  load_state
+  ST_OPACITY=$want
+  save_state
+  find_player || return 0
+  hl_eval "local w = 'address:$ADDR'
+$(opacity_lua)"
+}
+
+cmd_status() {
+  local running=false
+  load_state
+  if find_player; then
+    running=true
+  else
+    VISIBLE=false
+  fi
+  jq -nc --argjson running "$running" --argjson visible "$VISIBLE" \
+    --arg source "${SRC:-$ST_SOURCE}" --arg size "$(current_size)" --arg corner "$ST_CORNER" \
+    --argjson opacity "$ST_OPACITY" \
+    '{running: $running, visible: $visible, source: $source, size: $size, corner: $corner, opacity: $opacity}'
+}
+
+cmd_helper() { # cmd_helper <script> args…
+  local script="$DIR/$1"
+  shift
+  [[ -x $script ]] || die "$(basename "$script") is not installed (expected at $script)"
+  exec "$script" "$@"
+}
+
+cmd_launch_raw() {
+  local s="" url=""
+  while (($#)); do
+    case $1 in
+      --source) s=${2:-} && shift 2 ;;
+      --source=*) s=${1#*=} && shift ;;
+      --url) url=${2:-} && shift 2 ;;
+      --url=*) url=${1#*=} && shift ;;
+      *) die "launch-raw: unknown argument '$1'" ;;
+    esac
+  done
+  is_source "$s" || die "launch-raw: --source must be one of: ${FP_SOURCES[*]}"
+  [[ -n $url ]] || die "launch-raw: --url is required"
+  take_lock wait
+  open_source "$s" "$url"
+}
+
+main() {
+  local cmd=${1:-}
+  [[ $# -gt 0 ]] && shift
+  case $cmd in
+    -h | --help | help | "")
+      usage
+      [[ -n $cmd ]] || exit 1
+      return 0
+      ;;
+  esac
+  require hyprctl jq flock
+  case $cmd in
+    open) cmd_open "$@" ;;
+    toggle) cmd_toggle ;;
+    show) cmd_show ;;
+    hide) cmd_hide ;;
+    close) cmd_close ;;
+    size) cmd_size "$@" ;;
+    corner) cmd_corner "$@" ;;
+    opacity) cmd_opacity "$@" ;;
+    status) cmd_status ;;
+    signin) cmd_helper floating-player-signin "$@" ;;
+    scan) cmd_helper floating-player-scan "$@" ;;
+    launch-raw) cmd_launch_raw "$@" ;;
+    *) die "unknown command '$cmd' (see floating-player --help)" ;;
+  esac
+}
+
+main "$@"

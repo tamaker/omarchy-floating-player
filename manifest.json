@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "tamaker.floating-player",
+  "name": "Floating Player",
+  "version": "0.1.0",
+  "author": "tamaker",
+  "license": "MIT",
+  "description": "A small, resizable, always-on-top YouTube / YouTube TV player, driven from a bar icon.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Floating Player",
+    "description": "Click to show/hide the floating YouTube / YouTube TV player, middle-click to cycle its size, right-click for sources, size, position, phone (QR) sign-in and camera QR scan.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "defaultSource": "youtube",
+      "defaultSize": "medium"
+    },
+    "schema": [
+      { "key": "defaultSource", "type": "enum", "label": "Default source", "options": ["youtube", "youtubetv"], "defaultValue": "youtube", "description": "Used when the player is launched without picking a source." },
+      { "key": "defaultSize", "type": "enum", "label": "Default size", "options": ["small", "medium", "large"], "defaultValue": "medium", "description": "Size of a newly launched player." }
+    ]
+  }
+}

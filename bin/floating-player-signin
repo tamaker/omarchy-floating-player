@@ -1,0 +1,324 @@
+#!/bin/bash
+# floating-player-signin: sign in to YouTube / YouTube TV inside the floating
+# player, using the TV apps' own "scan this QR code with your phone" flow.
+#
+#   floating-player-signin [youtube|youtubetv|all] [--wait] [--timeout SECS] [--no-keys]
+#   floating-player-signin --check
+#
+# Opens the source's sign-in page with `floating-player launch-raw`, makes the
+# player large, and (unless already signed in or --no-keys) presses the keys
+# from lib/sources.sh in the player window a few seconds later so the TV app
+# goes from its welcome screen to the QR code. No source = the last-used one
+# (state.json), youtube the first time. "all" signs in to every source in turn
+# and implies --wait. --wait blocks until the profile looks signed in (or SECS
+# pass, default 300), then says so and puts the player back to its previous
+# size. --check prints one JSON line, {"youtube":true|false|null,"youtubetv":…}
+# (null = can't tell), and never touches the player. Env: FP_SIGNIN_KEY_DELAY
+# (seconds before the keys, default 8). See docs/signin.md for the findings.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/sources.sh
+source "$DIR/../lib/sources.sh"
+
+FP="$DIR/floating-player"
+FP_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/floating-player"
+POLL=3
+KEY_DELAY=${FP_SIGNIN_KEY_DELAY:-8}
+[[ $KEY_DELAY =~ ^[0-9]+([.][0-9]+)?$ ]] || KEY_DELAY=8
+
+die() {
+  printf 'floating-player-signin: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+usage: floating-player-signin [youtube|youtubetv|all] [--wait] [--timeout SECS] [--no-keys]
+       floating-player-signin --check
+
+Opens the source's sign-in screen in the floating player (size large, so the
+QR code is easy to scan) and tells you what to do: scan the QR code with your
+phone camera, or enter the code shown at yt.be/activate (YouTube) or
+tv.youtube.com/start (YouTube TV) on any device.
+
+  (no source)   the last-used source (youtube the first time)
+  all           every source in turn (implies --wait)
+  --wait        wait until sign-in is detected, then restore the player size
+  --timeout N   give up waiting after N seconds (default 300)
+  --no-keys     don't press keys in the player to reach the QR screen
+  --check       print {"youtube":true|false|null,"youtubetv":…} and exit
+EOF
+}
+
+is_source() {
+  local s
+  for s in "${FP_SOURCES[@]}"; do
+    [[ $s == "$1" ]] && return 0
+  done
+  return 1
+}
+
+profile_dir() {
+  printf '%s/profiles/%s/Default' "$FP_DATA" "$(fp_source "$1" profile)"
+}
+
+# --- sign-in detection --------------------------------------------------------
+
+# check_tvapp <profile Default dir> <localStorage prefix> -> true|false
+# The TV apps keep their accounts (OAuth tokens, not cookies) in localStorage
+# under "<prefix>::available-identities"; signed out / guest has no such key.
+# Chromium stores localStorage in LevelDB: recent writes sit uncompressed in
+# *.log as  <tag 0=del 1=put><len>_https://www.youtube.com\0\1<key>[<len>\1<value>],
+# older ones in snappy-compressed *.ldb tables. Read-only, no lock needed.
+check_tvapp() {
+  local db="$1/Local Storage/leveldb" key="$2::available-identities" last="" f
+  local -a logs=() tables=()
+  [[ -d $db ]] || {
+    echo false
+    return
+  }
+  for f in "$db"/*.log; do [[ -f $f ]] && logs+=("$f"); done
+  for f in "$db"/*.ldb; do [[ -f $f ]] && tables+=("$f"); done
+  if ((${#logs[@]})); then
+    # Newest record for the key wins (log file names grow with time).
+    last=$(cat "${logs[@]}" | tr '\n' '\036' |
+      LC_ALL=C grep -aoP "\Q$key\E.{0,64}" 2>/dev/null | tail -n 1 | tr -d '\000') || true
+    if [[ -n $last ]]; then
+      # A put is followed by <varint len>\1{"data":…; a delete by the next record.
+      if LC_ALL=C grep -aqP '^\Q'"$key"'\E[^{]{1,3}\{"data":(\[\]|\{\}|null|""|false)' <<<"$last"; then
+        echo false
+      elif LC_ALL=C grep -aqP '^\Q'"$key"'\E[^{]{1,3}\{"data":' <<<"$last"; then
+        echo true
+      else
+        echo false
+      fi
+      return
+    fi
+  fi
+  if ((${#tables[@]})) && LC_ALL=C grep -aqF "${key#*::}" "${tables[@]}" 2>/dev/null; then
+    echo true
+    return
+  fi
+  echo false
+}
+
+# check_cookies <profile Default dir> -> true|false|null
+# Google session cookies that only exist while signed in. The DB is locked
+# while the browser runs, so query a copy.
+check_cookies() {
+  local db="$1/Cookies" tmp now n
+  [[ -f $db ]] || {
+    echo false
+    return
+  }
+  command -v sqlite3 >/dev/null 2>&1 || {
+    echo null
+    return
+  }
+  tmp=$(mktemp -d)
+  cp -f "$db" "$tmp/Cookies" 2>/dev/null || {
+    rm -rf "$tmp"
+    echo null
+    return
+  }
+  [[ -f $db-wal ]] && cp -f "$db-wal" "$tmp/Cookies-wal" 2>/dev/null
+  [[ -f $db-journal ]] && cp -f "$db-journal" "$tmp/Cookies-journal" 2>/dev/null
+  # Chromium time: microseconds since 1601-01-01.
+  now=$((($(date +%s) + 11644473600) * 1000000))
+  n=$(sqlite3 -readonly "file:$tmp/Cookies?mode=ro" \
+    "SELECT count(*) FROM cookies WHERE host_key IN ('.youtube.com','.google.com')
+       AND name IN ('SAPISID','__Secure-3PSID','__Secure-1PSID')
+       AND (expires_utc = 0 OR expires_utc > $now);" 2>/dev/null) || n=""
+  rm -rf "$tmp"
+  case $n in
+    '') echo null ;;
+    0) echo false ;;
+    *) echo true ;;
+  esac
+}
+
+# check_source <source> -> true|false|null
+check_source() {
+  local s=$1 auth dir
+  auth=$(fp_source "$s" auth)
+  dir=$(profile_dir "$s")
+  [[ -d $dir ]] || {
+    echo false
+    return
+  }
+  case $auth in
+    tvapp:*) check_tvapp "$dir" "${auth#tvapp:}" ;;
+    cookies) check_cookies "$dir" ;;
+    *) echo null ;;
+  esac
+}
+
+cmd_check() {
+  local s out="{" sep=""
+  for s in "${FP_SOURCES[@]}"; do
+    out+="$sep\"$s\":$(check_source "$s")"
+    sep=","
+  done
+  printf '%s}\n' "$out"
+}
+
+# --- sign-in flow ---------------------------------------------------------------
+
+notify() { # notify <summary> <body> [ms]
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a "Floating Player" -t "${3:-60000}" "$1" "$2" 2>/dev/null || true
+}
+
+last_source() {
+  local s=""
+  [[ -s $FP_DATA/state.json ]] && command -v jq >/dev/null 2>&1 &&
+    s=$(jq -r '.source // empty' "$FP_DATA/state.json" 2>/dev/null) || true
+  is_source "$s" && printf '%s' "$s" || printf '%s' "${FP_SOURCES[0]}"
+}
+
+current_size() {
+  "$FP" status 2>/dev/null | jq -r '.size // empty' 2>/dev/null || true
+}
+
+# player_window <source> -> Hyprland address of that source's browser window.
+# The browser pid is in the profile's SingletonLock ("hostname-PID").
+player_window() {
+  local lock pid
+  lock=$(readlink "$FP_DATA/profiles/$(fp_source "$1" profile)/SingletonLock" 2>/dev/null) || return 1
+  pid=${lock##*-}
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  hyprctl clients -j 2>/dev/null |
+    jq -er --argjson p "$pid" 'first(.[] | select(.pid == $p) | .address)' 2>/dev/null
+}
+
+# press_keys <source> <keys…>: once the TV app has loaded, press <keys> in the
+# player window to get from its welcome screen to the QR code. Hyprland's
+# send_key_state with a window target delivers them without moving focus.
+press_keys() {
+  local s=$1 addr="" k state i
+  shift
+  for ((i = 0; i < 20; i++)); do
+    addr=$(player_window "$s") && break
+    sleep 0.5
+  done
+  [[ $addr =~ ^0x[0-9a-f]+$ ]] || return 0
+  sleep "$KEY_DELAY"
+  for k in "$@"; do
+    [[ $k =~ ^[A-Za-z0-9_]+$ ]] || continue
+    for state in down up; do
+      hyprctl eval "hl.dispatch(hl.dsp.send_key_state({ mods = '', key = '$k', state = '$state', window = 'address:$addr' }))" >/dev/null 2>&1 || return 0
+      sleep 0.05
+    done
+    sleep 0.6
+  done
+}
+
+# sign_in <source> <wait 0|1> <timeout>
+sign_in() {
+  local s=$1 wait=$2 timeout=$3 title url hint was prev elapsed=0 summary body
+  local -a seq=()
+  title=$(fp_source "$s" title)
+  url=$(fp_source "$s" signin_url)
+  hint=$(fp_source "$s" signin_hint)
+  [[ -n $url ]] || die "source '$s' has no signin_url in lib/sources.sh"
+  was=$(check_source "$s")
+  prev=$(current_size)
+
+  "$FP" launch-raw --source "$s" --url "$url" || die "could not open the player for $title"
+  "$FP" size large >/dev/null 2>&1 || printf 'warning: could not resize the player\n' >&2
+
+  summary="Sign in to $title"
+  body=$hint
+  if [[ $was == true ]]; then
+    body="Already signed in. To add another account pick \"Add account\" in the account menu. $hint"
+  elif ((keys)); then
+    # Signed out the app opens on a welcome screen; press our way to the QR
+    # code in the background so this command returns right away.
+    read -ra seq <<<"$(fp_source "$s" signin_keys)"
+    if ((${#seq[@]})); then
+      # Own session, so a caller that kills our process group on exit (a bar
+      # widget) doesn't take the key presser with it.
+      if command -v setsid >/dev/null 2>&1; then
+        setsid -f "$DIR/floating-player-signin" --press-keys "$s" "${seq[@]}" </dev/null >/dev/null 2>&1
+      else
+        press_keys "$s" "${seq[@]}" </dev/null >/dev/null 2>&1 &
+      fi
+      body="The QR code appears in a few seconds. $hint"
+    fi
+  fi
+  printf '%s\n  %s\n' "$summary" "$body"
+  notify "$summary" "$body"
+
+  ((wait)) || return 0
+  [[ $was == true ]] && return 0
+  printf 'Waiting for sign-in (up to %ss)…\n' "$timeout"
+  while ((elapsed < timeout)); do
+    sleep "$POLL"
+    elapsed=$((elapsed + POLL))
+    if [[ $(check_source "$s") == true ]]; then
+      printf 'Signed in to %s.\n' "$title"
+      notify "Signed in to $title" "The floating player is ready." 5000
+      [[ $prev =~ ^(small|medium|full)$ ]] && "$FP" size "$prev" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  printf 'Gave up waiting for %s sign-in after %ss.\n' "$title" "$timeout" >&2
+  return 1
+}
+
+main() {
+  local target="" wait=0 check=0 timeout=300 keys=1 s rc=0
+  if [[ ${1:-} == --press-keys ]]; then # internal, see sign_in
+    shift
+    is_source "${1:-}" || die "--press-keys: unknown source"
+    press_keys "$@"
+    return 0
+  fi
+  while (($#)); do
+    case $1 in
+      -h | --help | help)
+        usage
+        return 0
+        ;;
+      --check) check=1 ;;
+      --wait) wait=1 ;;
+      --no-keys) keys=0 ;;
+      --timeout)
+        [[ ${2:-} =~ ^[0-9]+$ ]] || die "--timeout needs a number of seconds"
+        timeout=$2
+        shift
+        ;;
+      --timeout=*)
+        timeout=${1#*=}
+        [[ $timeout =~ ^[0-9]+$ ]] || die "--timeout needs a number of seconds"
+        ;;
+      all) target=all ;;
+      -*) die "unknown option '$1' (see --help)" ;;
+      *)
+        is_source "$1" || die "unknown source '$1' (expected: ${FP_SOURCES[*]} or all)"
+        target=$1
+        ;;
+    esac
+    shift
+  done
+
+  if ((check)); then
+    cmd_check
+    return 0
+  fi
+
+  [[ -x $FP ]] || die "floating-player not found at $FP"
+  command -v jq >/dev/null 2>&1 || die "'jq' is required"
+
+  if [[ $target == all ]]; then
+    for s in "${FP_SOURCES[@]}"; do
+      sign_in "$s" 1 "$timeout" || rc=1
+    done
+    return "$rc"
+  fi
+  [[ -n $target ]] || target=$(last_source)
+  sign_in "$target" "$wait" "$timeout"
+}
+
+main "$@"

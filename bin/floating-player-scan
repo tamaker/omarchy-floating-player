@@ -1,0 +1,501 @@
+#!/bin/bash
+# floating-player scan: read a QR code (e.g. a phone showing a YouTube "Share ->
+# QR code") with the laptop camera and open the link in the floating player.
+#
+# One ffmpeg process owns the camera. It feeds a small mirrored preview to mpv
+# (floating, centered, Esc cancels) and writes a grayscale still a few times a
+# second, which zbarimg decodes. The decoded text is only ever treated as data:
+# validated as an http(s) URL and passed as a single argument to
+# `floating-player open`. See docs/scan.md.
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PROG="floating-player scan"
+APP_ID="floating-player-scan"
+RULE_VAR="floating_player_scan_rule"
+
+TIMEOUT=60
+PRINT_ONLY=0
+PREVIEW=1
+DEVICE="${FLOATING_PLAYER_CAMERA:-}"
+IMAGE=""
+
+# Exit codes
+E_OK=0 E_ERR=1 E_NOT_URL=2 E_NO_CODE=3 E_CANCEL=4
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options]
+
+Hold a QR code (e.g. YouTube's Share -> QR code on your phone) up to the camera;
+the link opens in the floating player.
+
+Options:
+  --timeout <sec>    give up after this many seconds (default $TIMEOUT)
+  --device <path>    camera to use (default: \$FLOATING_PLAYER_CAMERA, else auto-detect).
+                     A still image or video file also works (handy for testing).
+  --print            only print the decoded text; don't open anything
+  --no-preview       don't show the camera preview window
+  --image <file>     decode a QR code from an image file instead of the camera
+  --list             list the cameras auto-detection would try, best first
+  -h, --help         show this help
+
+Exit status: 0 opened/printed, 1 error, 2 decoded text is not a link,
+3 no QR code found before the timeout, 4 cancelled.
+EOF
+}
+
+# ---------------------------------------------------------------- feedback
+
+NOTIFY_ID=""
+
+markup_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  printf '%s' "$s"
+}
+
+# notify <low|normal|critical> <message> [expire-ms]
+# Replaces the previous notification from this run so the user sees one bubble.
+notify() {
+  local urgency="$1" message="${2//[$'\n\r']/ }" expire="${3:-}"
+  printf '%s: %s\n' "$PROG" "$message" >&2
+  command -v notify-send >/dev/null 2>&1 || return 0
+  [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] || return 0
+  local args=(-p -a "Floating Player" -i camera-web -u "$urgency")
+  [[ -n $expire ]] && args+=(-t "$expire")
+  [[ -n $NOTIFY_ID ]] && args+=(-r "$NOTIFY_ID")
+  NOTIFY_ID="$(notify-send "${args[@]}" "Scan QR code" "$(markup_escape "$message")" 2>/dev/null)" || NOTIFY_ID=""
+}
+
+die() {
+  local code="$1"
+  shift
+  notify critical "$*"
+  exit "$code"
+}
+
+# ---------------------------------------------------------------- camera discovery
+
+# Lists usable capture nodes as "score<TAB>/dev/videoN<TAB>name", best first.
+# Skips raw sensor/ISP nodes (Intel IPU "ISYS" nodes deliver raw Bayer and need
+# the vendor ISP stack), metadata-only nodes and nodes we can't open.
+camera_candidates() {
+  local node dev name info driver score relays
+  relays="$(pgrep -a v4l2-relayd 2>/dev/null || true)"
+  for node in /sys/class/video4linux/video*; do
+    [[ -e $node ]] || continue
+    dev="/dev/${node##*/}"
+    [[ -c $dev && -r $dev && -w $dev ]] || continue
+    name="$(cat "$node/name" 2>/dev/null || true)"
+    case "$name" in
+      *ISYS* | *"IPU"*" Capture"* | *[Mm]etadata*) continue ;;
+    esac
+    info="$(v4l2-ctl -d "$dev" --info 2>/dev/null)" || continue
+    # Device Caps (not the whole-driver Capabilities) must include Video Capture.
+    awk '/^[[:space:]]*Device Caps/ { on = 1; next }
+         on && /^[[:space:]]*Video Capture([[:space:]]|$)/ { found = 1 }
+         on && /^[^[:space:]]/ { on = 0 }
+         END { exit !found }' <<<"$info" || continue
+    v4l2-ctl -d "$dev" --list-formats 2>/dev/null | grep -q "^[[:space:]]*\[[0-9]" || continue
+    driver="$(awk -F': *' '/Driver name/ { print $2; exit }' <<<"$info")"
+    if [[ $relays == *"device=$dev"* || $relays == *"device=$dev "* ]]; then
+      score=40 # loopback fed by v4l2-relayd from an IPU6/IPU7 ISP camera
+    elif [[ $driver == uvcvideo ]]; then
+      score=30
+    elif [[ $driver == *loopback* ]]; then
+      case "${name,,}" in
+        *obs* | *dummy*) score=1 ;;
+        *) score=10 ;;
+      esac
+    else
+      score=20
+    fi
+    printf '%s\t%s\t%s\n' "$score" "$dev" "$name"
+  done | sort -t $'\t' -k1,1nr -k2,2V
+}
+
+# Prints ffmpeg input options for a V4L2 device: prefer a 720p-ish size (plenty
+# for a phone-screen QR code, cheap to decode) and MJPEG when the camera offers it.
+v4l2_input_opts() {
+  local dev="$1" formats pick
+  formats="$(v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null || true)"
+  pick="$(awk '
+    /\[[0-9]+\]:/ { match($0, /'"'"'[^'"'"']+'"'"'/); fmt = substr($0, RSTART + 1, RLENGTH - 2) }
+    /Size: Discrete/ { print fmt, $3 }' <<<"$formats" |
+    awk '
+      BEGIN { split("1280x720 1920x1080 960x540 1024x576 640x480 800x600", pref, " ") }
+      { have[$1 " " $2] = 1; any[$2] = $1 }
+      END {
+        for (i = 1; i in pref; i++) if (have["MJPG " pref[i]]) { print "mjpeg", pref[i]; exit }
+        for (i = 1; i in pref; i++) if (pref[i] in any) { print "-", pref[i]; exit }
+      }')"
+  if [[ -n $pick ]]; then
+    local fmt="${pick%% *}" size="${pick##* }"
+    [[ $fmt != - ]] && printf '%s\n' -input_format "$fmt"
+    printf '%s\n' -video_size "$size"
+  fi
+}
+
+# ---------------------------------------------------------------- decoded text handling
+
+# Prints the first QR code found in an image (raw bytes as text), or fails.
+decode_image() {
+  zbarimg -q --raw -Sdisable -Sqrcode.enable "$1" 2>/dev/null
+}
+
+url_host() {
+  local rest="${1#*://}"
+  rest="${rest%%[/?#]*}"
+  rest="${rest##*@}"
+  rest="${rest%%:*}"
+  rest="${rest%.}"
+  printf '%s' "${rest,,}"
+}
+
+is_youtube_host() {
+  case "$1" in
+    youtube.com | *.youtube.com | youtu.be | youtube-nocookie.com | *.youtube-nocookie.com) return 0 ;;
+  esac
+  return 1
+}
+
+# Validates decoded text and hands it to the player. Never evaluates it.
+handle_decoded() {
+  local text="$1" url host
+  # Trim surrounding whitespace / CR (phones sometimes append a newline).
+  url="${text#"${text%%[![:space:]]*}"}"
+  url="${url%"${url##*[![:space:]]}"}"
+
+  if ((PRINT_ONLY)); then
+    printf '%s\n' "$text"
+    notify low "Decoded: $(printf '%.200s' "$url")"
+    return "$E_OK"
+  fi
+
+  if ((${#url} > 4096)) || [[ ! $url =~ ^[Hh][Tt][Tt][Pp][Ss]?://[^[:space:][:cntrl:]]+$ ]]; then
+    notify normal "That QR code isn't a web link: $(printf '%.120s' "$url")"
+    return "$E_NOT_URL"
+  fi
+  host="$(url_host "$url")"
+  if [[ -z $host ]]; then
+    notify normal "That QR code isn't a usable web link: $(printf '%.120s' "$url")"
+    return "$E_NOT_URL"
+  fi
+
+  if ! is_youtube_host "$host"; then
+    printf '%s: note: %s is not a YouTube link; opening it in the player anyway\n' "$PROG" "$host" >&2
+  fi
+
+  if [[ ! -x $DIR/floating-player ]]; then
+    die "$E_ERR" "Decoded $url but $DIR/floating-player is missing"
+  fi
+  local rc=0
+  "$DIR/floating-player" open "$url" || rc=$?
+  if ((rc == 0)); then
+    if is_youtube_host "$host"; then
+      notify low "Opened $(printf '%.200s' "$url")"
+    else
+      notify normal "Opened $(printf '%.200s' "$url") (not a YouTube link)"
+    fi
+  else
+    notify critical "Couldn't open $(printf '%.200s' "$url") (floating-player exited $rc)"
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- Hyprland placement
+
+hypr_available() {
+  [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command -v hyprctl >/dev/null 2>&1
+}
+
+# Registers (replacing any earlier one) a runtime window rule so the preview maps
+# floating, pinned and centered at ~40 % of the monitor width. Lives only in the
+# running compositor; nothing in ~/.config/hypr is touched.
+RULE_SET=0
+set_preview_rule() {
+  hypr_available || return 1
+  local lua
+  lua="if $RULE_VAR then $RULE_VAR:set_enabled(false) end; $RULE_VAR = hl.window_rule({ match = { class = \"^$APP_ID\$\" }, float = true, pin = true, center = true, size = { \"(monitor_w*2/5)\", \"(monitor_w*9/40)\" }, keep_aspect_ratio = true, tag = \"-default-opacity\", opacity = \"1 1\" })"
+  if hyprctl eval "$lua" 2>&1 | grep -qiE '^error|error:'; then
+    return 1
+  fi
+  RULE_SET=1
+}
+
+clear_preview_rule() {
+  ((RULE_SET)) || return 0
+  hyprctl eval "if $RULE_VAR then $RULE_VAR:set_enabled(false) end; $RULE_VAR = nil" >/dev/null 2>&1 || true
+  RULE_SET=0
+}
+
+hypr_dispatch() {
+  local lua="$1"
+  shift
+  hyprctl dispatch "$lua" >/dev/null 2>&1 || hyprctl dispatch "$@" >/dev/null 2>&1 || true
+}
+
+# Fallback when the runtime rule couldn't be set (older, non-Lua Hyprland):
+# float / size / center the preview once it maps.
+place_preview_after_map() {
+  hypr_available || return 0
+  local i client address floating mon_w w h
+  for ((i = 0; i < 50; i++)); do
+    client="$(hyprctl clients -j 2>/dev/null | jq -c --arg c "$APP_ID" 'first(.[] | select(.class == $c)) // empty' 2>/dev/null || true)"
+    [[ -n $client ]] && break
+    sleep 0.1
+  done
+  [[ -n $client ]] || return 0
+  address="$(jq -r .address <<<"$client")"
+  floating="$(jq -r .floating <<<"$client")"
+  mon_w="$(hyprctl monitors -j 2>/dev/null | jq -r --argjson id "$(jq .monitor <<<"$client")" \
+    'first(.[] | select(.id == $id)) | ((if (.transform % 2) == 1 then .height else .width end) / .scale) | floor' 2>/dev/null || echo 1536)"
+  [[ $mon_w =~ ^[0-9]+$ ]] || mon_w=1536
+  w=$((mon_w * 2 / 5))
+  h=$((w * 9 / 16))
+  local win="address:$address"
+  [[ $floating == true ]] || hypr_dispatch "hl.dsp.window.float({ action = \"toggle\", window = \"$win\" })" setfloating "$win"
+  hypr_dispatch "hl.dsp.window.resize({ window = \"$win\", x = $w, y = $h })" resizewindowpixel "exact $w $h,$win"
+  hypr_dispatch "hl.dsp.window.center({ window = \"$win\" })" centerwindow
+  hypr_dispatch "hl.dsp.window.pin({ action = \"enable\", window = \"$win\" })" pin "$win"
+}
+
+# ---------------------------------------------------------------- capture session
+
+WORK=""
+FFMPEG_PID=""
+MPV_PID=""
+STDERR_LOG=""
+
+stop_capture() {
+  local pid
+  for pid in "$MPV_PID" "$FFMPEG_PID"; do
+    [[ -n $pid ]] && kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "$MPV_PID" "$FFMPEG_PID"; do
+    [[ -n $pid ]] || continue
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  MPV_PID="" FFMPEG_PID=""
+}
+
+# shellcheck disable=SC2329 # invoked from the EXIT trap
+cleanup() {
+  stop_capture
+  clear_preview_rule
+  [[ -n $WORK && -d $WORK ]] && rm -rf "$WORK"
+  return 0
+}
+
+# start_capture <device>: starts ffmpeg (+ mpv preview). Returns 0 once the first
+# frame has been written, 1 if this device produced nothing.
+start_capture() {
+  local dev="$1" frame="$WORK/frame.png" fifo="$WORK/preview.nut" input=()
+  rm -f "$frame" "$fifo"
+  STDERR_LOG="$WORK/ffmpeg.log"
+
+  if [[ -c $dev ]]; then
+    mapfile -t input < <(v4l2_input_opts "$dev")
+    input=(-f v4l2 -use_wallclock_as_timestamps 1 "${input[@]}" -i "$dev")
+  elif [[ -f $dev ]]; then
+    case "${dev,,}" in
+      *.png | *.jpg | *.jpeg | *.webp | *.bmp) input=(-re -loop 1 -framerate 15 -i "$dev") ;;
+      *) input=(-re -stream_loop -1 -i "$dev") ;;
+    esac
+  else
+    printf '%s: %s is not a camera device or file\n' "$PROG" "$dev" >&2
+    return 1
+  fi
+
+  local decode_chain="fps=4,scale='min(1280,iw)':-2,format=gray"
+  if ((PREVIEW)); then
+    mkfifo "$fifo"
+    ffmpeg -nostdin -hide_banner -loglevel error "${input[@]}" \
+      -filter_complex "[0:v]split=2[p][d];[p]scale=640:-2:flags=fast_bilinear,hflip,format=yuv420p[pv];[d]${decode_chain}[dv]" \
+      -map '[pv]' -c:v rawvideo -f nut -y "$fifo" \
+      -map '[dv]' -update 1 -atomic_writing 1 -y "$frame" \
+      9>&- 2>"$STDERR_LOG" &
+    FFMPEG_PID=$!
+
+    printf '%s\n' 'ESC quit 4' 'q quit 4' 'Q quit 4' >"$WORK/input.conf"
+    mpv --no-config --input-conf="$WORK/input.conf" \
+      --wayland-app-id="$APP_ID" --x11-name="$APP_ID" \
+      --title="Scan QR code - Esc to cancel" \
+      --profile=low-latency --untimed --cache=no --demuxer-lavf-format=nut \
+      --force-window=immediate --keepaspect-window=yes \
+      --no-audio --no-osc --osd-level=0 --idle=no --keep-open=no \
+      --really-quiet "$fifo" 9>&- >/dev/null 2>&1 &
+    MPV_PID=$!
+    if ((!RULE_SET)) && hypr_available; then
+      place_preview_after_map &
+    fi
+  else
+    ffmpeg -nostdin -hide_banner -loglevel error "${input[@]}" \
+      -vf "$decode_chain" -update 1 -atomic_writing 1 -y "$frame" \
+      9>&- 2>"$STDERR_LOG" &
+    FFMPEG_PID=$!
+  fi
+
+  # Wait (up to 10 s) for the first frame; a busy/broken node makes ffmpeg exit.
+  local i
+  for ((i = 0; i < 100; i++)); do
+    [[ -s $frame ]] && return 0
+    kill -0 "$FFMPEG_PID" 2>/dev/null || break
+    if [[ -n $MPV_PID ]] && ! kill -0 "$MPV_PID" 2>/dev/null; then
+      return 0 # preview closed already; the main loop reports the cancel
+    fi
+    sleep 0.1
+  done
+  printf '%s: %s gave no frames: %s\n' "$PROG" "$dev" "$(tail -n 2 "$STDERR_LOG" 2>/dev/null | tr '\n' ' ')" >&2
+  stop_capture
+  return 1
+}
+
+frame_is_dark() {
+  command -v magick >/dev/null 2>&1 || return 1
+  local mean
+  mean="$(magick "$1" -format '%[fx:mean]' info: 2>/dev/null)" || return 1
+  awk -v m="$mean" 'BEGIN { exit !(m < 0.03) }'
+}
+
+scan_camera() {
+  local devices=() dev line
+  if [[ -n $DEVICE ]]; then
+    devices=("$DEVICE")
+  else
+    while IFS=$'\t' read -r _ dev _; do
+      devices+=("$dev")
+    done < <(camera_candidates)
+  fi
+  ((${#devices[@]})) || die "$E_ERR" "No usable camera found (set FLOATING_PLAYER_CAMERA=/dev/videoN to choose one)"
+
+  if ((PREVIEW)) && [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+    PREVIEW=0
+  fi
+  if ((PREVIEW)) && ! command -v mpv >/dev/null 2>&1; then
+    printf '%s: mpv not found; scanning without a preview\n' "$PROG" >&2
+    PREVIEW=0
+  fi
+  ((PREVIEW)) && { set_preview_rule || true; }
+
+  notify normal "Hold the QR code up to the camera… (Esc cancels)" "$((TIMEOUT * 1000))"
+
+  local started=0 used=""
+  for dev in "${devices[@]}"; do
+    if start_capture "$dev"; then
+      started=1 used="$dev"
+      break
+    fi
+  done
+  if ((!started)); then
+    line="$(tail -n 1 "$STDERR_LOG" 2>/dev/null || true)"
+    die "$E_ERR" "Couldn't start the camera${line:+: $line} (in use by another app?)"
+  fi
+  printf '%s: using %s\n' "$PROG" "$used" >&2
+
+  local frame="$WORK/frame.png" text="" dark_checked=0 start=$SECONDS
+  while ((SECONDS - start < TIMEOUT)); do
+    if [[ -n $MPV_PID ]] && ! kill -0 "$MPV_PID" 2>/dev/null; then
+      stop_capture
+      notify low "Scan cancelled" 2000
+      return "$E_CANCEL"
+    fi
+    if ! kill -0 "$FFMPEG_PID" 2>/dev/null; then
+      line="$(tail -n 1 "$STDERR_LOG" 2>/dev/null || true)"
+      stop_capture
+      die "$E_ERR" "Camera stopped unexpectedly${line:+: $line}"
+    fi
+    if [[ -s $frame ]] && text="$(decode_image "$frame")" && [[ -n $text ]]; then
+      break
+    fi
+    text=""
+    if ((!dark_checked && SECONDS - start >= 10)); then
+      dark_checked=1
+      if [[ -s $frame ]] && frame_is_dark "$frame"; then
+        notify normal "The camera picture is black. Is the privacy shutter closed or the lens covered? Still scanning…" "$(((TIMEOUT - 10) * 1000))"
+      fi
+    fi
+    sleep 0.2
+  done
+
+  # Release the camera (LED off) and close the preview before anything else.
+  stop_capture
+  clear_preview_rule
+
+  if [[ -z $text ]]; then
+    notify normal "No QR code found" 4000
+    return "$E_NO_CODE"
+  fi
+  DECODED="$text"
+  return 0
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  while (($#)); do
+    case "$1" in
+      --timeout)
+        [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || { printf '%s: --timeout needs a positive number of seconds\n' "$PROG" >&2; exit "$E_ERR"; }
+        TIMEOUT="$2"; shift 2 ;;
+      --timeout=*)
+        TIMEOUT="${1#*=}"
+        [[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || { printf '%s: --timeout needs a positive number of seconds\n' "$PROG" >&2; exit "$E_ERR"; }
+        shift ;;
+      --device) [[ -n ${2:-} ]] || { usage >&2; exit "$E_ERR"; }; DEVICE="$2"; shift 2 ;;
+      --device=*) DEVICE="${1#*=}"; shift ;;
+      --image) [[ -n ${2:-} ]] || { usage >&2; exit "$E_ERR"; }; IMAGE="$2"; shift 2 ;;
+      --image=*) IMAGE="${1#*=}"; shift ;;
+      --print) PRINT_ONLY=1; shift ;;
+      --no-preview) PREVIEW=0; shift ;;
+      --list)
+        camera_candidates | awk -F'\t' '{ printf "%s  %s (score %s)\n", $2, $3, $1 }'
+        exit "$E_OK" ;;
+      -h | --help) usage; exit "$E_OK" ;;
+      *) printf '%s: unknown option %s\n' "$PROG" "$1" >&2; usage >&2; exit "$E_ERR" ;;
+    esac
+  done
+
+  local cmd
+  for cmd in zbarimg ffmpeg v4l2-ctl; do
+    [[ -n $IMAGE && $cmd != zbarimg ]] && continue
+    command -v "$cmd" >/dev/null 2>&1 || die "$E_ERR" "Missing $cmd (install zbar, ffmpeg and v4l-utils)"
+  done
+
+  DECODED=""
+  if [[ -n $IMAGE ]]; then
+    [[ -r $IMAGE ]] || die "$E_ERR" "Can't read $IMAGE"
+    DECODED="$(decode_image "$IMAGE")" || DECODED=""
+    [[ -n $DECODED ]] || { notify normal "No QR code found in $IMAGE" 4000; exit "$E_NO_CODE"; }
+  else
+    local runtime="${XDG_RUNTIME_DIR:-/tmp}/floating-player"
+    mkdir -p "$runtime"
+    exec 9>"$runtime/scan.lock"
+    flock -n 9 || die "$E_ERR" "A QR scan is already running"
+    WORK="$(mktemp -d "$runtime/scan.XXXXXX")"
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+
+    local rc=0
+    scan_camera || rc=$?
+    ((rc == 0)) || exit "$rc"
+    # Let the next scan start while the player (possibly long-lived) launches.
+    flock -u 9
+    exec 9>&-
+  fi
+
+  local rc=0
+  handle_decoded "$DECODED" || rc=$?
+  exit "$rc"
+}
+
+main "$@"
